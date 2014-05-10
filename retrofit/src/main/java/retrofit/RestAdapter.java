@@ -38,10 +38,6 @@ import retrofit.mime.MimeUtil;
 import retrofit.mime.TypedByteArray;
 import retrofit.mime.TypedInput;
 import retrofit.mime.TypedOutput;
-import rx.Observable;
-import rx.Scheduler;
-import rx.Subscriber;
-import rx.schedulers.Schedulers;
 
 /**
  * Adapts a Java interface to a REST API.
@@ -160,7 +156,7 @@ public class RestAdapter {
 
   private final Client.Provider clientProvider;
   private final Profiler profiler;
-  private final RxSupport rxSupport;
+  private RxSupport rxSupport;
 
   volatile LogLevel logLevel;
 
@@ -177,11 +173,6 @@ public class RestAdapter {
     this.errorHandler = errorHandler;
     this.log = log;
     this.logLevel = logLevel;
-    if (Platform.HAS_RX_JAVA && httpExecutor != null) {
-      this.rxSupport = new RxSupport(httpExecutor, errorHandler);
-    } else {
-      this.rxSupport = null;
-    }
   }
 
   /** Change the level of logging. */
@@ -227,40 +218,6 @@ public class RestAdapter {
     }
   }
 
-  /** Indirection to avoid VerifyError if RxJava isn't present. */
-  private static final class RxSupport {
-    private final Scheduler scheduler;
-    private final ErrorHandler errorHandler;
-
-    RxSupport(Executor executor, ErrorHandler errorHandler) {
-      this.scheduler = Schedulers.executor(executor);
-      this.errorHandler = errorHandler;
-    }
-
-    Observable createRequestObservable(final Callable<ResponseWrapper> request) {
-      return Observable.create(new Observable.OnSubscribe<Object>() {
-        @Override public void call(Subscriber<? super Object> subscriber) {
-          if (subscriber.isUnsubscribed()) {
-            return;
-          }
-          try {
-            ResponseWrapper wrapper = request.call();
-            if (subscriber.isUnsubscribed()) {
-              return;
-            }
-            subscriber.onNext(wrapper.responseBody);
-            subscriber.onCompleted();
-          } catch (RetrofitError e) {
-            subscriber.onError(errorHandler.handleError(e));
-          } catch (Exception e) {
-            // This is from the Callable.  It shouldn't actually throw.
-            throw new RuntimeException(e);
-          }
-        }
-      }).subscribeOn(scheduler);
-    }
-  }
-
   private class RestHandler implements InvocationHandler {
     private final Map<Method, RestMethodInfo> methodDetailsCache;
 
@@ -302,6 +259,13 @@ public class RestAdapter {
       requestInterceptor.intercept(interceptorTape);
 
       if (methodInfo.isObservable) {
+        if (rxSupport == null) {
+          if (Platform.HAS_RX_JAVA) {
+            rxSupport = new RxSupport(httpExecutor, errorHandler);
+          } else {
+            throw new IllegalStateException("Observable method found but no RxJava on classpath");
+          }
+        }
         return rxSupport.createRequestObservable(new Callable<ResponseWrapper>() {
           @Override public ResponseWrapper call() throws Exception {
             return (ResponseWrapper) invokeRequest(interceptorTape, methodInfo, args);
@@ -324,8 +288,8 @@ public class RestAdapter {
      * @return HTTP response object of specified {@code type} or {@code null}.
      * @throws RetrofitError if any error occurs during the HTTP request.
      */
-    private Object invokeRequest(RequestInterceptor requestInterceptor,
-        RestMethodInfo methodInfo, Object[] args) {
+    private Object invokeRequest(RequestInterceptor requestInterceptor, RestMethodInfo methodInfo,
+        Object[] args) {
       methodInfo.init(); // Ensure all relevant method information has been loaded.
 
       String serverUrl = server.getUrl();
